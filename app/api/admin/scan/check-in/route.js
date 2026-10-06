@@ -6,6 +6,10 @@ import { getDB } from "@/lib/db";
 
 export async function POST(request) {
   try {
+    // =====================================================
+    // ADMIN AUTH
+    // =====================================================
+
     const session = await auth();
 
     if (
@@ -21,13 +25,16 @@ export async function POST(request) {
       );
     }
 
+    // =====================================================
+    // REQUEST
+    // =====================================================
+
     const body = await request.json();
 
-    const code =
-      body?.code
-        ?.toString()
-        .trim()
-        .toUpperCase();
+    const code = body?.code
+      ?.toString()
+      .trim()
+      .toUpperCase();
 
     if (!code) {
       return NextResponse.json(
@@ -41,17 +48,9 @@ export async function POST(request) {
 
     const db = await getDB();
 
-    /*
-     * =====================================================
-     * GUEST PASS QR
-     * =====================================================
-     *
-     * Guest pass is already reserved for an event.
-     *
-     * AVAILABLE  -> can be reserved
-     * RESERVED   -> waiting for event check-in
-     * USED       -> guest checked in
-     */
+    // =====================================================
+    // GUEST PASS QR
+    // =====================================================
 
     if (code.startsWith("GP-")) {
       const guestPass =
@@ -81,10 +80,10 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Guest must have been reserved
-       * for an event before arriving.
-       */
+      // ---------------------------------------------------
+      // PASS STATUS
+      // ---------------------------------------------------
+
       if (guestPass.status === "AVAILABLE") {
         return NextResponse.json(
           {
@@ -121,10 +120,10 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Reserved guest pass must have
-       * an event attached.
-       */
+      // ---------------------------------------------------
+      // EVENT ID
+      // ---------------------------------------------------
+
       if (
         !guestPass.eventId ||
         !ObjectId.isValid(
@@ -142,9 +141,10 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Find event.
-       */
+      // ---------------------------------------------------
+      // EVENT
+      // ---------------------------------------------------
+
       const event =
         await db.collection("events").findOne({
           _id: guestPass.eventId,
@@ -174,9 +174,10 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Find member who owns the guest pass.
-       */
+      // ---------------------------------------------------
+      // MEMBER
+      // ---------------------------------------------------
+
       const member =
         await db.collection("members").findOne({
           _id: guestPass.memberId,
@@ -194,23 +195,26 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Find the event registration that
-       * reserved this guest pass.
-       */
+      // ---------------------------------------------------
+      // REGISTRATION
+      // ---------------------------------------------------
+      //
+      // Supports:
+      // GUEST
+      // SELF_PASS
+      //
+      // We primarily identify the registration by
+      // guestPassId so both types work.
+      //
+
       const registration =
         await db
           .collection("event_registrations")
           .findOne({
             eventId: guestPass.eventId,
-
             memberId: guestPass.memberId,
-
-            "guest.enabled": true,
-
             "guest.guestPassId":
               guestPass._id,
-
             status: {
               $in: [
                 "REGISTERED",
@@ -231,12 +235,13 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Guest already checked in.
-       */
+      // ---------------------------------------------------
+      // ALREADY ATTENDED
+      // ---------------------------------------------------
+
       if (
-        registration.guest?.status ===
-        "ATTENDED"
+        registration.status === "ATTENDED" ||
+        registration.guest?.status === "ATTENDED"
       ) {
         return NextResponse.json(
           {
@@ -251,15 +256,9 @@ export async function POST(request) {
 
       const now = new Date();
 
-      /*
-       * ==========================================
-       * MARK GUEST PASS USED
-       * ==========================================
-       *
-       * No transaction.
-       * No startSession.
-       * No findOneAndUpdate.
-       */
+      // ===================================================
+      // MARK GUEST PASS USED
+      // ===================================================
 
       const passUpdate =
         await db
@@ -267,7 +266,6 @@ export async function POST(request) {
           .updateOne(
             {
               _id: guestPass._id,
-
               status: "RESERVED",
             },
             {
@@ -286,9 +284,7 @@ export async function POST(request) {
             }
           );
 
-      if (
-        passUpdate.modifiedCount !== 1
-      ) {
+      if (passUpdate.modifiedCount !== 1) {
         return NextResponse.json(
           {
             success: false,
@@ -300,11 +296,9 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * ==========================================
-       * UPDATE EVENT REGISTRATION GUEST
-       * ==========================================
-       */
+      // ===================================================
+      // UPDATE REGISTRATION
+      // ===================================================
 
       const registrationUpdate =
         await db
@@ -312,11 +306,14 @@ export async function POST(request) {
           .updateOne(
             {
               _id: registration._id,
-
-              "guest.status": "RESERVED",
+              status: "REGISTERED",
             },
             {
               $set: {
+                status: "ATTENDED",
+
+                attendedAt: now,
+
                 "guest.status":
                   "ATTENDED",
 
@@ -326,23 +323,17 @@ export async function POST(request) {
           );
 
       if (
-        registrationUpdate.modifiedCount !==
-        1
+        registrationUpdate.modifiedCount !== 1
       ) {
-        /*
-         * We don't have transactions on
-         * this MongoDB deployment.
-         *
-         * Try to restore the guest pass
-         * if registration update failed.
-         */
+        // -----------------------------------------------
+        // ROLLBACK PASS
+        // -----------------------------------------------
 
         await db
           .collection("guest_passes")
           .updateOne(
             {
               _id: guestPass._id,
-
               status: "USED",
             },
             {
@@ -369,11 +360,9 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * ==========================================
-       * CREATE GUEST ATTENDANCE
-       * ==========================================
-       */
+      // ===================================================
+      // CREATE ATTENDANCE
+      // ===================================================
 
       const attendance = {
         memberId:
@@ -386,6 +375,15 @@ export async function POST(request) {
           registration._id,
 
         type: "GUEST_PASS",
+
+        registrationType:
+          registration.registrationType ||
+          (
+            registration.passUsage ===
+            "SELF"
+              ? "SELF_PASS"
+              : "GUEST"
+          ),
 
         status: "PRESENT",
 
@@ -440,6 +438,18 @@ export async function POST(request) {
           guestPassCode:
             guestPass.code,
 
+          registrationId:
+            registration._id.toString(),
+
+          registrationType:
+            registration.registrationType ||
+            (
+              registration.passUsage ===
+              "SELF"
+                ? "SELF_PASS"
+                : "GUEST"
+            ),
+
           member: {
             id:
               member._id.toString(),
@@ -462,6 +472,8 @@ export async function POST(request) {
             mobile:
               registration.guest?.mobile ||
               "",
+
+            status: "ATTENDED",
           },
 
           event: {
@@ -489,11 +501,9 @@ export async function POST(request) {
       });
     }
 
-    /*
-     * =====================================================
-     * MEMBER EVENT QR
-     * =====================================================
-     */
+    // =====================================================
+    // MEMBER EVENT QR
+    // =====================================================
 
     if (code.startsWith("ER-")) {
       const registration =
@@ -514,6 +524,10 @@ export async function POST(request) {
           { status: 404 }
         );
       }
+
+      // ---------------------------------------------------
+      // ALREADY ATTENDED
+      // ---------------------------------------------------
 
       if (
         registration.status ===
@@ -545,9 +559,26 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Find event.
-       */
+      // ---------------------------------------------------
+      // DETERMINE REGISTRATION TYPE
+      // ---------------------------------------------------
+
+      const registrationType =
+        registration.registrationType ||
+        (
+          registration.passUsage ===
+          "GUEST"
+            ? "GUEST"
+            : registration.passUsage ===
+              "SELF"
+              ? "SELF_PASS"
+              : "MEMBERSHIP"
+        );
+
+      // ---------------------------------------------------
+      // EVENT
+      // ---------------------------------------------------
+
       const event =
         await db.collection("events").findOne({
           _id: registration.eventId,
@@ -577,9 +608,10 @@ export async function POST(request) {
         );
       }
 
-      /*
-       * Find member.
-       */
+      // ---------------------------------------------------
+      // MEMBER
+      // ---------------------------------------------------
+
       const member =
         await db.collection("members").findOne({
           _id: registration.memberId,
@@ -599,51 +631,561 @@ export async function POST(request) {
 
       const now = new Date();
 
-      /*
-       * ==========================================
-       * CHECK IN MEMBER
-       * ==========================================
-       */
+      // ===================================================
+      // MEMBERSHIP REGISTRATION
+      // ===================================================
+      //
+      // IMPORTANT:
+      //
+      // Registration:
+      // reserved + 1
+      //
+      // Actual QR scan:
+      // reserved - 1
+      // used + 1
+      //
+      // Therefore the Sunday experience is consumed
+      // ONLY when the member actually checks in.
+      //
+
+      let membership = null;
+
+      if (
+        registrationType ===
+        "MEMBERSHIP"
+      ) {
+        membership =
+          await db
+            .collection("memberships")
+            .findOne({
+              _id:
+                registration.membershipId ||
+                undefined,
+
+              memberId:
+                registration.memberId,
+
+              plan:
+                "PURPLE_MEMBERSHIP",
+
+              status:
+                "ACTIVE",
+            });
+
+        // If membershipId was not stored in the
+        // registration, fall back to memberId.
+        if (!membership) {
+          membership =
+            await db
+              .collection("memberships")
+              .findOne({
+                memberId:
+                  registration.memberId,
+
+                plan:
+                  "PURPLE_MEMBERSHIP",
+
+                status:
+                  "ACTIVE",
+              });
+        }
+
+        if (!membership) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "Active Purple Membership was not found for this registration.",
+            },
+            { status: 404 }
+          );
+        }
+
+        const total =
+          Number(
+            membership.sundayExperiences
+              ?.total
+          ) || 4;
+
+        const used =
+          Number(
+            membership.sundayExperiences
+              ?.used
+          ) || 0;
+
+        const reserved =
+          Number(
+            membership.sundayExperiences
+              ?.reserved
+          ) || 0;
+
+        // -----------------------------------------------
+        // MUST HAVE RESERVED EXPERIENCE
+        // -----------------------------------------------
+
+        if (reserved <= 0) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This membership does not have a reserved Sunday experience for this registration.",
+            },
+            { status: 409 }
+          );
+        }
+
+        // -----------------------------------------------
+        // CANNOT EXCEED TOTAL
+        // -----------------------------------------------
+
+        if (used >= total) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "All Sunday experiences included with this membership have already been used.",
+            },
+            { status: 409 }
+          );
+        }
+
+        // -----------------------------------------------
+        // ATOMIC GUARD
+        // -----------------------------------------------
+
+        const experienceUpdate =
+          await db
+            .collection("memberships")
+            .updateOne(
+              {
+                _id:
+                  membership._id,
+
+                status:
+                  "ACTIVE",
+
+                $expr: {
+                  $and: [
+                    {
+                      $gt: [
+                        {
+                          $ifNull: [
+                            "$sundayExperiences.reserved",
+                            0,
+                          ],
+                        },
+                        0,
+                      ],
+                    },
+
+                    {
+                      $lt: [
+                        {
+                          $ifNull: [
+                            "$sundayExperiences.used",
+                            0,
+                          ],
+                        },
+
+                        {
+                          $ifNull: [
+                            "$sundayExperiences.total",
+                            4,
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+              {
+                $inc: {
+                  "sundayExperiences.reserved":
+                    -1,
+
+                  "sundayExperiences.used":
+                    1,
+                },
+
+                $set: {
+                  updatedAt: now,
+                },
+              }
+            );
+
+        // -----------------------------------------------
+        // SOMEONE ELSE USED IT FIRST
+        // -----------------------------------------------
+
+        if (
+          experienceUpdate.modifiedCount !==
+          1
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This Sunday experience is no longer available. Please scan again.",
+            },
+            { status: 409 }
+          );
+        }
+      }
+
+      // ===================================================
+      // SELF PASS / GUEST PASS REGISTRATION
+      // ===================================================
+
+      let guestPass = null;
+      let passWasUsed = false;
+
+      if (
+        registrationType ===
+          "SELF_PASS" ||
+        registrationType ===
+          "GUEST"
+      ) {
+        // -----------------------------------------------
+        // GET PASS ID
+        // -----------------------------------------------
+
+        const guestPassId =
+          registration.guest
+            ?.guestPassId;
+
+        if (
+          !guestPassId ||
+          !ObjectId.isValid(
+            guestPassId.toString()
+          )
+        ) {
+          // Roll back membership if somehow this
+          // registration was incorrectly mixed with
+          // membership consumption.
+          if (
+            registrationType ===
+            "MEMBERSHIP"
+          ) {
+            await db
+              .collection("memberships")
+              .updateOne(
+                {
+                  _id:
+                    membership._id,
+
+                  status:
+                    "ACTIVE",
+                },
+                {
+                  $inc: {
+                    "sundayExperiences.reserved":
+                      1,
+
+                    "sundayExperiences.used":
+                      -1,
+                  },
+
+                  $set: {
+                    updatedAt:
+                      new Date(),
+                  },
+                }
+              );
+          }
+
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "The free pass associated with this registration is invalid.",
+            },
+            { status: 400 }
+          );
+        }
+
+        guestPass =
+          await db
+            .collection("guest_passes")
+            .findOne({
+              _id:
+                new ObjectId(
+                  guestPassId.toString()
+                ),
+
+              memberId:
+                registration.memberId,
+
+              type:
+                "FREE",
+            });
+
+        if (!guestPass) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "The free pass associated with this registration was not found.",
+            },
+            { status: 404 }
+          );
+        }
+
+        if (
+          guestPass.status ===
+          "USED"
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This free pass has already been used.",
+            },
+            { status: 409 }
+          );
+        }
+
+        if (
+          guestPass.status !==
+          "RESERVED"
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This free pass is not available for check-in.",
+            },
+            { status: 400 }
+          );
+        }
+
+        // -----------------------------------------------
+        // PASS MUST BELONG TO SAME EVENT
+        // -----------------------------------------------
+
+        if (
+          !guestPass.eventId ||
+          guestPass.eventId.toString() !==
+            registration.eventId.toString()
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This free pass is not linked to this event.",
+            },
+            { status: 400 }
+          );
+        }
+
+        // -----------------------------------------------
+        // RESERVED -> USED
+        // -----------------------------------------------
+
+        const passUpdate =
+          await db
+            .collection("guest_passes")
+            .updateOne(
+              {
+                _id:
+                  guestPass._id,
+
+                memberId:
+                  registration.memberId,
+
+                type:
+                  "FREE",
+
+                status:
+                  "RESERVED",
+
+                eventId:
+                  registration.eventId,
+              },
+              {
+                $set: {
+                  status:
+                    "USED",
+
+                  usedAt:
+                    now,
+
+                  usedBy:
+                    new ObjectId(
+                      session.user.id
+                    ),
+
+                  updatedAt:
+                    now,
+                },
+              }
+            );
+
+        if (
+          passUpdate.modifiedCount !==
+          1
+        ) {
+          return NextResponse.json(
+            {
+              success: false,
+              type: "EVENT",
+              message:
+                "This free pass was already used or is no longer available.",
+            },
+            { status: 409 }
+          );
+        }
+
+        passWasUsed = true;
+      }
+
+      // ===================================================
+      // UPDATE EVENT REGISTRATION
+      // ===================================================
 
       const updateResult =
         await db
           .collection("event_registrations")
           .updateOne(
             {
-              _id: registration._id,
+              _id:
+                registration._id,
 
-              status: "REGISTERED",
+              status:
+                "REGISTERED",
             },
             {
               $set: {
-                status: "ATTENDED",
+                status:
+                  "ATTENDED",
 
-                attendedAt: now,
+                attendedAt:
+                  now,
 
-                updatedAt: now,
+                updatedAt:
+                  now,
+
+                ...(registrationType ===
+                  "MEMBERSHIP"
+                  ? {
+                      experienceStatus:
+                        "USED",
+                    }
+                  : {}),
+
+                ...(
+                  registrationType ===
+                    "SELF_PASS" ||
+                  registrationType ===
+                    "GUEST"
+                    ? {
+                        "guest.status":
+                          "ATTENDED",
+                      }
+                    : {}
+                ),
               },
             }
           );
 
       if (
-        updateResult.modifiedCount !== 1
+        updateResult.modifiedCount !==
+        1
       ) {
+        // =================================================
+        // ROLLBACK MEMBERSHIP EXPERIENCE
+        // =================================================
+
+        if (
+          registrationType ===
+            "MEMBERSHIP" &&
+          membership
+        ) {
+          await db
+            .collection("memberships")
+            .updateOne(
+              {
+                _id:
+                  membership._id,
+
+                status:
+                  "ACTIVE",
+              },
+              {
+                $inc: {
+                  "sundayExperiences.reserved":
+                    1,
+
+                  "sundayExperiences.used":
+                    -1,
+                },
+
+                $set: {
+                  updatedAt:
+                    new Date(),
+                },
+              }
+            );
+        }
+
+        // =================================================
+        // ROLLBACK FREE PASS
+        // =================================================
+
+        if (
+          passWasUsed &&
+          guestPass
+        ) {
+          await db
+            .collection("guest_passes")
+            .updateOne(
+              {
+                _id:
+                  guestPass._id,
+
+                status:
+                  "USED",
+              },
+              {
+                $set: {
+                  status:
+                    "RESERVED",
+
+                  usedAt:
+                    null,
+
+                  usedBy:
+                    null,
+
+                  updatedAt:
+                    new Date(),
+                },
+              }
+            );
+        }
+
         return NextResponse.json(
           {
             success: false,
             type: "EVENT",
             message:
-              "This registration was already checked in.",
+              "This registration was already checked in. No additional experience or pass was consumed.",
           },
           { status: 409 }
         );
       }
 
-      /*
-       * ==========================================
-       * MEMBER ATTENDANCE
-       * ==========================================
-       */
+      // ===================================================
+      // CREATE ATTENDANCE
+      // ===================================================
 
       const attendance = {
         memberId:
@@ -655,40 +1197,224 @@ export async function POST(request) {
         registrationId:
           registration._id,
 
-        type: "EVENT",
+        type:
+          "EVENT",
 
-        status: "PRESENT",
+        registrationType,
 
-        checkedInAt: now,
+        status:
+          "PRESENT",
+
+        checkedInAt:
+          now,
 
         checkedInBy:
           new ObjectId(
             session.user.id
           ),
 
-        createdAt: now,
+        createdAt:
+          now,
 
-        updatedAt: now,
+        updatedAt:
+          now,
       };
 
-      const attendanceResult =
-        await db
-          .collection("attendance")
-          .insertOne(attendance);
+      if (
+        registrationType ===
+        "MEMBERSHIP"
+      ) {
+        attendance.experienceStatus =
+          "USED";
+      }
 
-      /*
-       * ==========================================
-       * MEMBER RESPONSE
-       * ==========================================
-       */
+      if (
+        registrationType ===
+          "SELF_PASS" ||
+        registrationType ===
+          "GUEST"
+      ) {
+        attendance.guestPassId =
+          guestPass?._id || null;
+
+        attendance.guestPassCode =
+          guestPass?.code || null;
+
+        attendance.guest = {
+          name:
+            registration.guest?.name ||
+            "",
+
+          mobile:
+            registration.guest?.mobile ||
+            "",
+        };
+      }
+
+      let attendanceResult;
+
+      try {
+        attendanceResult =
+          await db
+            .collection("attendance")
+            .insertOne(
+              attendance
+            );
+      } catch (attendanceError) {
+        console.error(
+          "ATTENDANCE INSERT ERROR:",
+          attendanceError
+        );
+
+        // -----------------------------------------------
+        // ROLLBACK REGISTRATION
+        // -----------------------------------------------
+
+        await db
+          .collection("event_registrations")
+          .updateOne(
+            {
+              _id:
+                registration._id,
+
+              status:
+                "ATTENDED",
+            },
+            {
+              $set: {
+                status:
+                  "REGISTERED",
+
+                attendedAt:
+                  null,
+
+                ...(registrationType ===
+                  "MEMBERSHIP"
+                  ? {
+                      experienceStatus:
+                        "RESERVED",
+                    }
+                  : {}),
+
+                ...(
+                  registrationType ===
+                    "SELF_PASS" ||
+                  registrationType ===
+                    "GUEST"
+                    ? {
+                        "guest.status":
+                          "RESERVED",
+                      }
+                    : {}
+                ),
+
+                updatedAt:
+                  new Date(),
+              },
+            }
+          );
+
+        // -----------------------------------------------
+        // ROLLBACK MEMBERSHIP
+        // -----------------------------------------------
+
+        if (
+          registrationType ===
+            "MEMBERSHIP" &&
+          membership
+        ) {
+          await db
+            .collection("memberships")
+            .updateOne(
+              {
+                _id:
+                  membership._id,
+
+                status:
+                  "ACTIVE",
+              },
+              {
+                $inc: {
+                  "sundayExperiences.reserved":
+                    1,
+
+                  "sundayExperiences.used":
+                    -1,
+                },
+
+                $set: {
+                  updatedAt:
+                    new Date(),
+                },
+              }
+            );
+        }
+
+        // -----------------------------------------------
+        // ROLLBACK FREE PASS
+        // -----------------------------------------------
+
+        if (
+          passWasUsed &&
+          guestPass
+        ) {
+          await db
+            .collection("guest_passes")
+            .updateOne(
+              {
+                _id:
+                  guestPass._id,
+
+                status:
+                  "USED",
+              },
+              {
+                $set: {
+                  status:
+                    "RESERVED",
+
+                  usedAt:
+                    null,
+
+                  usedBy:
+                    null,
+
+                  updatedAt:
+                    new Date(),
+                },
+              }
+            );
+        }
+
+        return NextResponse.json(
+          {
+            success: false,
+            type: "EVENT",
+            message:
+              "Check-in could not be completed. Please scan again.",
+          },
+          { status: 500 }
+        );
+      }
+
+      // ===================================================
+      // MEMBER RESPONSE
+      // ===================================================
 
       return NextResponse.json({
         success: true,
 
-        type: "EVENT",
+        type:
+          "EVENT",
 
         message:
-          "Member checked in successfully.",
+          registrationType ===
+          "MEMBERSHIP"
+            ? "Member checked in successfully. One Sunday experience has been used."
+            : registrationType ===
+                "SELF_PASS"
+              ? "Member checked in successfully using the free pass."
+              : "Guest checked in successfully using the free pass.",
 
         data: {
           attendanceId:
@@ -696,6 +1422,8 @@ export async function POST(request) {
 
           registrationId:
             registration._id.toString(),
+
+          registrationType,
 
           qrCode:
             registration.qrCode,
@@ -734,45 +1462,110 @@ export async function POST(request) {
               event.location || "",
           },
 
-          /*
-           * Tell scanner whether this
-           * registration contains a guest.
-           */
-          guest: registration.guest?.enabled
-            ? {
-                enabled: true,
+          // ---------------------------------------------
+          // MEMBERSHIP EXPERIENCE
+          // ---------------------------------------------
 
-                name:
-                  registration.guest.name ||
-                  "",
+          membershipExperience:
+            registrationType ===
+            "MEMBERSHIP"
+              ? {
+                  consumed:
+                    true,
 
-                mobile:
-                  registration.guest.mobile ||
-                  "",
+                  status:
+                    "USED",
 
-                guestPassId:
-                  registration.guest.guestPassId
-                    ?.toString() ||
-                  null,
+                  total:
+                    Number(
+                      membership
+                        ?.sundayExperiences
+                        ?.total
+                    ) || 4,
 
-                status:
-                  registration.guest.status ||
-                  "RESERVED",
-              }
-            : {
-                enabled: false,
-              },
+                  used:
+                    Number(
+                      membership
+                        ?.sundayExperiences
+                        ?.used
+                    ) + 1,
 
-          checkedInAt: now,
+                  reserved:
+                    Math.max(
+                      Number(
+                        membership
+                          ?.sundayExperiences
+                          ?.reserved
+                      ) - 1,
+                      0
+                    ),
+                }
+              : null,
+
+          // ---------------------------------------------
+          // FREE PASS
+          // ---------------------------------------------
+
+          guestPass:
+            guestPass
+              ? {
+                  id:
+                    guestPass._id.toString(),
+
+                  code:
+                    guestPass.code,
+
+                  status:
+                    "USED",
+
+                  usage:
+                    registrationType,
+                }
+              : null,
+
+          // ---------------------------------------------
+          // GUEST
+          // ---------------------------------------------
+
+          guest:
+            registration.guest?.enabled ||
+            registrationType ===
+              "GUEST"
+              ? {
+                  enabled:
+                    true,
+
+                  name:
+                    registration.guest
+                      ?.name || "",
+
+                  mobile:
+                    registration.guest
+                      ?.mobile || "",
+
+                  guestPassId:
+                    registration.guest
+                      ?.guestPassId
+                      ?.toString() ||
+                    null,
+
+                  status:
+                    "ATTENDED",
+                }
+              : {
+                  enabled:
+                    false,
+                },
+
+          checkedInAt:
+            now,
         },
       });
     }
 
-    /*
-     * =====================================================
-     * UNKNOWN QR
-     * =====================================================
-     */
+    // =====================================================
+    // UNKNOWN QR
+    // =====================================================
 
     return NextResponse.json(
       {
